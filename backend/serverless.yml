@@ -1,0 +1,258 @@
+org: temporg
+app: serverless-book-app
+service: serverless-book-app
+frameworkVersion: '2.72.3'
+
+plugins:
+  - serverless-webpack
+  - serverless-iam-roles-per-function
+  - serverless-plugin-tracing
+  - serverless-reqvalidator-plugin
+  - serverless-aws-documentation
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+  lambdaHashingVersion: '20201221'
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  # Use these variables in the functions and resouorces section below. For example,
+  # ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+  environment:
+    TABLE: Book-table-${self:provider.stage}
+    CREATED_INDEX: CreatedAtIndex
+    SEARCH_INDEX: searchIndex
+    ATTACHMENT_S3_BUCKET: book-images-bucket-${self:provider.stage}
+    SIGNED_URL_EXPIRATION: 300
+
+  logs:
+    # Enable API Gateway logs
+    restApi: true
+
+custom:
+  documentation:
+    api:
+      info:
+        version: v1.0.0
+        title: Book App
+        description: Serverless application for books monitoring
+    models:
+      - name: CreateBookRequest
+        contentType: application/json
+        schema: ${file(models/create-book-model.json)}
+      - name: UpdateBookRequest
+        contentType: application/json
+        schema: ${file(models/update-book-model.json)}
+
+functions:
+  Authorizer:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  # Provide iamRoleStatements property for performing Actions on DynamoDB
+  GetBooksLambdaFunction:
+    handler: src/lambda/http/getBooks.handler
+    events:
+      - http:
+          method: get
+          path: books
+          cors: true
+          authorizer: Authorizer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+
+  FindBookLambdaFunction:
+    handler: src/lambda/http/searchBooks.handler
+    events:
+      - http:
+          method: get
+          path: books/search/{author}
+          cors: true
+          authorizer: Authorizer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}/index/${self:provider.environment.SEARCH_INDEX}
+
+  # Provide iamRoleStatements property. Decide the Actions and AWS Resource.
+  # To refer to an AWS resource defined in the "Resources" section, you can use "Resource: !GetAtt <resource-name>.Arn"
+  # To validate incoming HTTP requests, we have provided the request schemas in function definition below.
+  CreateBookLambdaFunction:
+    handler: src/lambda/http/createBook.handler
+    events:
+      - http:
+          method: post
+          path: books
+          cors: true
+          authorizer: Authorizer
+          reqValidatorName: RequestValidator
+          documentation:
+            summary: Create a book task
+            description: Create a book task
+            requestModels:
+              'application/json': CreateBookRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+
+  UpdateBookLambdaFunction:
+    handler: src/lambda/http/updateBook.handler
+    events:
+      - http:
+          method: patch
+          path: books/{bookId}
+          cors: true
+          authorizer: Authorizer
+          reqValidatorName: RequestValidator
+          documentation:
+            summary: Update a book task
+            description: Update a book task
+            requestModels:
+              'application/json': UpdateBookRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+
+  DeleteBookLambdaFunction:
+    handler: src/lambda/http/deleteBook.handler
+    events:
+      - http:
+          method: delete
+          path: books/{bookId}
+          cors: true
+          authorizer: Authorizer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+
+  UploadUrlLambdaFunction:
+    handler: src/lambda/http/uploadUrl.handler
+    events:
+      - http:
+          method: post
+          path: books/{bookId}/attachment
+          cors: true
+          authorizer: Authorizer
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:UpdateItem
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.TABLE}
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+          - s3:GetObject
+        Resource: arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*
+
+resources:
+  Resources:
+    GatewayResponseDefault:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Credentials: "'true'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi
+
+    RequestValidator:
+      Type: AWS::ApiGateway::RequestValidator
+      Properties:
+        Name: 'request-body-validator'
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ValidateRequestBody: true
+        ValidateRequestParameters: false
+
+    BooksTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: bookId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: searchAuthor
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: bookId
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.TABLE}
+        LocalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.CREATED_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.SEARCH_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: searchAuthor
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    AttachmentsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.ATTACHMENT_S3_BUCKET}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        PolicyDocument:
+          Id: MyPolicy
+          Version: '2012-10-17'
+          Statement:
+            - Sid: PublicReadForGetBucketObjects
+              Effect: Allow
+              Principal: '*'
+              Action: 's3:GetObject'
+              Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
+        Bucket: !Ref AttachmentsBucket
